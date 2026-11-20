@@ -97,7 +97,8 @@ function renderStatus(status) {
   $("m-segments").textContent = String(status.segments);
   $("m-bytes").textContent = `原始 ${fmtBytes(status.original_bytes)} · 存储 ${fmtBytes(status.stored_bytes)}`;
   $("m-backlog").textContent = String(status.backlog);
-  $("m-states").textContent = `待处理 ${status.states.pending} · 失败 ${status.states.failed}`;
+  $("m-states").textContent =
+    `待处理 ${status.states.pending} · 转换中 ${status.states.running} · 失败 ${status.states.failed}`;
 
   const worker = status.worker;
   $("m-worker").textContent = worker.enabled ? (worker.state === "converting" ? `#${worker.current_segment}` : "空闲") : "已停用";

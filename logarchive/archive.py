@@ -16,7 +16,7 @@ from typing import Any, Optional
 
 from . import storage
 from .config import Config
-from .db import Database
+from .db import Database, is_locked_error
 from .storage import StorageError
 
 log = logging.getLogger(__name__)
@@ -25,6 +25,12 @@ SEGMENT_LIMIT_DEFAULT = 100
 SEGMENT_LIMIT_MAX = 200
 MAX_FILENAME_LENGTH = 200
 MAX_DICTIONARY_NAME = 80
+
+# Backoff between attempts to (re)acquire the SQLite write lock while an
+# external maintenance transaction holds it.  The wait itself is interruptible
+# by shutdown, and the cap keeps recovery prompt once the lock clears.
+LOCK_RETRY_INITIAL_DELAY = 0.1
+LOCK_RETRY_MAX_DELAY = 5.0
 
 
 class NotFoundError(Exception):
@@ -75,7 +81,10 @@ class ArchiveService:
         self.dict_dir.mkdir(parents=True, exist_ok=True)
         self.tmp_dir.mkdir(parents=True, exist_ok=True)
 
-        self.db = Database(self.data_dir / "archive.sqlite3")
+        self.db = Database(
+            self.data_dir / "archive.sqlite3",
+            busy_timeout_seconds=config.db_busy_timeout_seconds,
+        )
         self.db.initialise()
 
         self._stop_event = threading.Event()
@@ -102,7 +111,7 @@ class ArchiveService:
         fresh attempt budget too, because a restart commonly clears transient
         causes such as a temporarily unreadable volume.
         """
-        with self.db.write() as conn:
+        with self.db.write_with_retry() as conn:
             interrupted = conn.execute(
                 """
                 UPDATE segments
@@ -188,27 +197,107 @@ class ArchiveService:
         try:
             while not self._stop_event.is_set():
                 self._wake_event.clear()
+                # An earlier loop iteration (or a process that vanished without
+                # a clean shutdown) can leave rows in 'running'.  In this
+                # single-instance service the worker is the only owner of that
+                # state, so anything left behind is orphaned work that must be
+                # re-queued.  Retry counters are deliberately untouched.
+                if not self._reap_stale_running():
+                    continue
                 processed = 0
                 try:
                     batch = self._claim_batch()
-                except Exception:  # pragma: no cover - defensive
+                except Exception as exc:
+                    # A locked database must never kill the worker: the next
+                    # iteration retries once the maintenance transaction ends.
+                    if is_locked_error(exc):
+                        log.warning(
+                            "database locked while claiming recompression work; "
+                            "will retry after the lock clears"
+                        )
+                        self._wake_event.wait(LOCK_RETRY_MAX_DELAY)
+                        continue
                     log.exception("could not claim recompression work")
                     batch = []
+                lock_stalled = False
                 for index, row in enumerate(batch):
                     if self._stop_event.is_set():
                         self._requeue_claimed(batch[index:])
                         break
-                    self._convert_claimed(row)
+                    try:
+                        self._convert_claimed(row)
+                    except sqlite3.OperationalError as exc:
+                        if not is_locked_error(exc):
+                            raise
+                        # The conversion's bookkeeping transaction could not
+                        # acquire the write lock.  Put this segment and every
+                        # sibling not started yet back in the queue without
+                        # spending the segment's retry budget, then wait for
+                        # the lock.  The reaper at the top of the next loop
+                        # also picks up anything this re-queue could not write.
+                        log.warning(
+                            "database locked during recompression of segment %d; "
+                            "re-queuing the rest of the batch until the lock clears",
+                            row["number"],
+                        )
+                        self._requeue_claimed([row, *batch[index + 1 :]])
+                        lock_stalled = True
+                        break
                     processed += 1
                     if self.config.recompress_delay_ms and not self._stop_event.is_set():
                         self._stop_event.wait(self.config.recompress_delay_ms / 1000.0)
                 self._worker_state = "idle"
                 if not processed:
-                    self._wake_event.wait(0.25)
+                    self._wake_event.wait(
+                        LOCK_RETRY_MAX_DELAY if lock_stalled else 0.25
+                    )
+        except Exception:
+            # Absolute last line of defence: the worker must never die silently
+            # and leave the web UI stuck on a never-finishing conversion.  The
+            # stale-row reaper on the next pass recovers any half-written job.
+            log.exception("unexpected error in the recompression worker loop")
+            self._worker_state = "idle"
+            if not self._stop_event.is_set():
+                self._stop_event.wait(LOCK_RETRY_MAX_DELAY)
+                if not self._stop_event.is_set():
+                    self._worker_loop()
         finally:
-            self._worker_state = "stopped"
+            if self._stop_event.is_set():
+                self._worker_state = "stopped"
             self._current_segment = None
             log.info("recompression worker stopped")
+
+    def _reap_stale_running(self) -> bool:
+        """Re-queue 'running' rows no live conversion can still own.
+
+        Only this single-instance worker ever writes the 'running' state, and
+        it converts one segment at a time inside the worker loop.  The reaper
+        runs when no conversion is in flight (between batches), so every
+        'running' row it sees is orphaned: a previous loop iteration was
+        interrupted before its bookkeeping, typically by database lock
+        contention.  The rows go back to 'pending' with
+        ``recompress_attempts`` preserved, so a lock-induced interruption
+        never spends the segment's retry budget.
+
+        Returns ``False`` when shutdown interrupted the write and the loop
+        should exit instead of claiming new work.
+        """
+        try:
+            with self.db.write_with_retry(wait=self._stop_event.wait) as conn:
+                conn.execute(
+                    """
+                    UPDATE segments
+                       SET recompress_state = 'pending',
+                           recompress_token = NULL,
+                           recompress_next_at = 0
+                     WHERE recompress_state = 'running'
+                    """
+                )
+        except sqlite3.OperationalError as exc:
+            if is_locked_error(exc) and self._stop_event.is_set():
+                return False
+            raise
+        return True
 
     def _claim_batch(self) -> list[sqlite3.Row]:
         with self.db.read() as conn:
@@ -231,7 +320,7 @@ class ArchiveService:
             return []
         token = uuid.uuid4().hex
         claimed: list[dict[str, Any]] = []
-        with self.db.write() as conn:
+        with self.db.write_with_retry(wait=self._stop_event.wait) as conn:
             for row in rows:
                 cur = conn.execute(
                     """
@@ -248,9 +337,15 @@ class ArchiveService:
         return claimed
 
     def _requeue_claimed(self, rows: list[dict[str, Any]]) -> None:
+        """Return claimed-but-unfinished rows to the queue.
+
+        Retry counters and backoff are intentionally left untouched: this is
+        used for shutdown, for dictionary switches and for lock-induced
+        interruptions, none of which are conversion failures.
+        """
         if not rows:
             return
-        with self.db.write() as conn:
+        with self.db.write_with_retry(wait=self._stop_event.wait) as conn:
             for row in rows:
                 conn.execute(
                     """
@@ -321,7 +416,12 @@ class ArchiveService:
             new_blob_path = final_blob
 
             committed = False
-            with self.db.write() as conn:
+            abandoned = False
+            # The commit is the only write lock this conversion needs.  If a
+            # maintenance transaction holds that lock, the whole commit is
+            # retried (the conditional UPDATE makes every retry idempotent)
+            # instead of failing the segment or stalling the worker.
+            with self.db.write_with_retry(wait=self._stop_event.wait) as conn:
                 current = self._active_dictionary(conn)
                 if not current or current["id"] != target_id:
                     conn.execute(
@@ -335,6 +435,7 @@ class ArchiveService:
                         """,
                         (number, row["recompress_token"]),
                     )
+                    abandoned = True
                 else:
                     cur = conn.execute(
                         """
@@ -359,6 +460,9 @@ class ArchiveService:
                     )
                     committed = cur.rowcount == 1
 
+            # The blob cleanup runs only after the transaction eventually
+            # commits, so a lock-induced retry can never remove a file another
+            # attempt still needs.
             if committed:
                 old_blob = self.blob_dir / row["blob_name"]
                 if old_blob != final_blob:
@@ -370,26 +474,57 @@ class ArchiveService:
                     row["original_size"],
                     comp_size,
                 )
-            else:
+            elif abandoned:
                 storage.remove_quietly(final_blob)
                 new_blob_path = None
                 log.info(
                     "segment %d recompression abandoned; dictionary changed mid-flight",
                     number,
                 )
-        except Exception as exc:
-            log.warning("recompression of segment %d failed: %s", number, exc)
+            else:
+                # The conditional update matched nothing: another flow (e.g. a
+                # dictionary activation) already took ownership of the row.
+                storage.remove_quietly(final_blob)
+                new_blob_path = None
+        except sqlite3.OperationalError as exc:
+            # Lock contention is an infrastructure delay, not a failed
+            # conversion: do not spend the retry budget.  Drop any blob that
+            # was installed, re-raise so the worker loop re-queues the batch,
+            # and the next loop iteration resumes automatically once the
+            # maintenance transaction releases the write lock.
+            if not is_locked_error(exc):
+                self._record_conversion_failure(row, exc, new_blob_path, original_tmp)
+                return
+            log.warning(
+                "recompression of segment %d blocked by a database lock: %s",
+                number,
+                exc,
+            )
             if new_blob_path:
                 storage.remove_quietly(new_blob_path)
-            self._record_failure(row, exc)
+            raise
+        except Exception as exc:
+            self._record_conversion_failure(row, exc, new_blob_path, original_tmp)
         finally:
             if original_tmp:
                 storage.remove_quietly(original_tmp)
             self._current_segment = None
             self._worker_state = "idle"
 
+    def _record_conversion_failure(
+        self,
+        row: dict[str, Any],
+        exc: Exception,
+        new_blob_path: Optional[Path],
+        original_tmp: Optional[Path],
+    ) -> None:
+        log.warning("recompression of segment %d failed: %s", row["number"], exc)
+        if new_blob_path:
+            storage.remove_quietly(new_blob_path)
+        self._record_failure(row, exc)
+
     def _mark_done_without_work(self, row: dict[str, Any], target_id: str) -> None:
-        with self.db.write() as conn:
+        with self.db.write_with_retry(wait=self._stop_event.wait) as conn:
             conn.execute(
                 """
                 UPDATE segments
@@ -407,8 +542,13 @@ class ArchiveService:
         backoff = 0.0 if exhausted else min(60.0, float(2 ** min(attempts, 6)))
         message = f"{type(exc).__name__}: {exc}"[:500]
         # The original blob is left untouched: only retry bookkeeping changes.
-        with self.db.write() as conn:
-            conn.execute(
+        # A locked database must not prevent the failure from being recorded,
+        # otherwise the row would be stuck in 'running' forever; the write is
+        # retried until the lock clears.  Lock contention itself is handled one
+        # level up and never reaches this method, so each genuine failure
+        # increments the attempt counter exactly once.
+        with self.db.write_with_retry(wait=self._stop_event.wait) as conn:
+            cur = conn.execute(
                 """
                 UPDATE segments
                    SET recompress_state = ?,
@@ -427,6 +567,14 @@ class ArchiveService:
                     row["number"],
                     row["recompress_token"],
                 ),
+            )
+            recorded = cur.rowcount == 1
+        if not recorded:
+            # The row was re-queued or reclaimed elsewhere (e.g. a dictionary
+            # switch reset it); leave its retry budget alone.
+            log.info(
+                "segment %d no longer owns its conversion; failure not recorded",
+                row["number"],
             )
 
     def _verify_compressed(
@@ -481,7 +629,7 @@ class ArchiveService:
                 os.fsync(fh.fileno())
             final = self.dict_dir / f"{dictionary_id}.dict"
             storage.atomic_install(temp, final)
-            with self.db.write() as conn:
+            with self.db.write_with_retry() as conn:
                 conn.execute(
                     """
                     INSERT INTO dictionaries (id, name, size, sha256, active, created_at)
@@ -534,7 +682,7 @@ class ArchiveService:
         }
 
     def activate_dictionary(self, dictionary_id: str) -> dict[str, Any]:
-        with self.db.write() as conn:
+        with self.db.write_with_retry() as conn:
             row = conn.execute(
                 "SELECT * FROM dictionaries WHERE id = ?", (dictionary_id,)
             ).fetchone()
@@ -565,7 +713,7 @@ class ArchiveService:
         return self.get_dictionary(dictionary_id)
 
     def delete_dictionary(self, dictionary_id: str) -> None:
-        with self.db.write() as conn:
+        with self.db.write_with_retry() as conn:
             row = conn.execute(
                 "SELECT * FROM dictionaries WHERE id = ?", (dictionary_id,)
             ).fetchone()
@@ -633,7 +781,7 @@ class ArchiveService:
                 storage.atomic_install(blob_tmp, final_blob)
                 installed = final_blob
 
-                with self.db.write() as conn:
+                with self.db.write_with_retry() as conn:
                     current = self._active_dictionary(conn)
                     current_id = current["id"] if current else None
                     if current_id != dictionary_id:
@@ -857,7 +1005,7 @@ class ArchiveService:
     # --------------------------------------------------------------- operations
 
     def retry_recompression(self, number: Optional[int] = None) -> dict[str, Any]:
-        with self.db.write() as conn:
+        with self.db.write_with_retry() as conn:
             if number is not None:
                 row = conn.execute(
                     "SELECT number FROM segments WHERE number = ?", (number,)
@@ -891,10 +1039,22 @@ class ArchiveService:
         """Synchronous conversion helper used by tests and manual recovery."""
         processed = 0
         for _ in range(max(1, limit)):
+            # Same stale-row recovery as the background loop, so a manual run
+            # also resumes work that an interrupted run left in 'running'.
+            if not self._reap_stale_running():
+                break
             batch = self._claim_batch()
             if not batch:
                 break
-            self._convert_claimed(batch[0])
+            try:
+                self._convert_claimed(batch[0])
+            except sqlite3.OperationalError as exc:
+                if is_locked_error(exc):
+                    # The background loop owns recovery when the database is
+                    # locked; a synchronous caller just reports nothing done.
+                    self._requeue_claimed(batch)
+                    break
+                raise
             if len(batch) > 1:
                 self._requeue_claimed(batch[1:])
             processed += 1

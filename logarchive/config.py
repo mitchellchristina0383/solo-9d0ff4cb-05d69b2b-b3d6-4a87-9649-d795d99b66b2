@@ -30,6 +30,7 @@ class Config:
     recompress_batch_size: int = 8
     worker_enabled: bool = True
     max_recompress_attempts: int = 5
+    db_busy_timeout_seconds: float = 30.0
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -49,5 +50,8 @@ class Config:
             worker_enabled=_bool(os.environ.get("WORKER_ENABLED"), True),
             max_recompress_attempts=max(
                 1, _int(os.environ.get("MAX_RECOMPRESS_ATTEMPTS"), 5)
+            ),
+            db_busy_timeout_seconds=max(
+                1.0, float(os.environ.get("DB_BUSY_TIMEOUT_SECONDS", "30"))
             ),
         )

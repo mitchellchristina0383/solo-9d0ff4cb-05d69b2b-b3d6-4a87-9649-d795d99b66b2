@@ -74,9 +74,21 @@ python3 -m logarchive.cli wait
 ### 失败与中断
 
 - 任何异常（解压失败、校验不一致、磁盘错误……）都只回滚**这一次转换**：原段、原字典、
-  原 blob 保持不变，段仍可下载；记录错误并指数退避重试。
+  原 blob 保持不变，段仍可下载；记录错误并指数退避重试。**每次真实失败只让
+  `recompress_attempts` 加 1**，数据库锁等待不计入失败次数。
 - 连续失败 `MAX_RECOMPRESS_ATTEMPTS` 次后标记为 `failed`，不再自动重试；页面显示
   原因并可单段或“全部重试”。`failed` 的段**不**计入待换版数量。
+- **SQLite 写锁占用（如手工维护事务）期间服务不卡死、无需重启**：
+  - 所有写事务（激活字典、入库提交、重压提交、失败登记、领取/重排队列）都走带退避的
+    `write_with_retry`：拿不到写锁时按 0.1s→5s 的封顶指数退避反复重试，锁释放后自动完成；
+    单次语句另受 `DB_BUSY_TIMEOUT_SECONDS` 的 busy timeout 保护。
+  - 后台 worker 自身对锁错误免疫：锁冲突只让当前批次回到 `pending`，**重试次数保持原值**，
+    同批已领取但尚未开工的段在下一轮接着转；worker 线程不会因锁异常退出。
+  - 每轮 worker 循环开头的“孤儿回收”会把任何遗留在 `running` 的段重新排队（同样保留
+    重试次数），因此即使某次状态写入被锁打断，网页上的“转换中”也会在解锁后自动推进，
+    不会永久卡住。
+  - 锁等待期间读路径（WAL）与下载不受影响，按段号下载始终返回原字节；新压缩结果只有在
+    元数据事务提交后才替换旧 blob，提交前下载到的仍是旧 blob 解压出的相同原文。
 - 进程重启时：
   - 状态为 `running` 的段（说明上次死在转换中途）重新排队——旧 blob 从未被替换，
     所以重头再来是安全的；
@@ -84,7 +96,8 @@ python3 -m logarchive.cli wait
   - `blobs/`、`dictionaries/`、`tmp/` 中的孤儿文件被清理（仅在工作线程启用的进程里做，
     避免和数据目录共享的只读副本互相踩）。
 - 重压在目标字典不再是生效字典时（又换版了）会放弃该次结果并重新排队，不会写入
-  过期版本。
+  过期版本。恢复期间若启用了另一本字典，旧任务的提交会因生效字典校验/令牌条件落空而
+  作废，绝不可能覆盖新一轮换版状态。
 
 ### 字典删除
 
@@ -124,6 +137,7 @@ python3 -m logarchive.cli wait
 | `RECOMPRESS_DELAY_MS` | `100` | 后台每段之间的间隔 |
 | `RECOMPRESS_BATCH_SIZE` | `8` | 一次领取的段数 |
 | `MAX_RECOMPRESS_ATTEMPTS` | `5` | 单段连续失败上限 |
+| `DB_BUSY_TIMEOUT_SECONDS` | `30` | 单条语句等待 SQLite 写锁的最长时间；超时后由服务层退避重试 |
 | `WORKER_ENABLED` | `true` | 关闭后只入库/下载，不自动重压 |
 | `LOG_LEVEL` | `INFO` | 日志级别 |
 
@@ -150,9 +164,10 @@ python3 -m logarchive.cli wait
 ## 测试
 
 ```bash
-python3 -m unittest discover -s tests -v        # 37 个用例：服务层 + HTTP 层
+python3 -m unittest discover -s tests -v        # 43 个用例：服务层 + HTTP 层
 python3 scripts/acceptance_walkthrough.py --url http://localhost:8080
 python3 scripts/interruption_test.py            # 自带服务进程，SIGKILL 中断后续转
+python3 scripts/lock_recovery_test.py           # 自带服务进程，长占写锁、解锁后自动续转
 ```
 
 `scripts/acceptance_walkthrough.py` 会真实地在上传进行到一半时激活新字典，然后

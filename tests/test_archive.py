@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import os
 import shutil
+import sqlite3
 import tempfile
 import threading
 import time
@@ -378,6 +379,294 @@ class RecompressionResilienceTests(ArchiveTestCase):
             len(list(self.service.blob_dir.iterdir())),
             self.service.list_segments()["total"],
         )
+
+
+class DatabaseLockResilienceTests(ArchiveTestCase):
+    def _hold_write_lock(self, hold_seconds: float) -> tuple[threading.Thread, threading.Event]:
+        """Hold an external BEGIN IMMEDIATE transaction for *hold_seconds*."""
+        released = threading.Event()
+
+        def holder() -> None:
+            conn = self.service.db.connect()
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                conn.execute(
+                    "UPDATE dictionaries SET name = name WHERE active = 1"
+                )
+                released.set()
+                time.sleep(hold_seconds)
+                conn.execute("COMMIT")
+            finally:
+                conn.close()
+
+        thread = threading.Thread(target=holder)
+        thread.start()
+        self.assertTrue(released.wait(5), "external lock was never acquired")
+        return thread, released
+
+    def test_commit_blocked_by_lock_retries_until_unlocked_without_retry_cost(self) -> None:
+        v1, v2 = self.make_dictionaries()
+        self.service.activate_dictionary(v1["id"])
+        segment = self.upload("first.log")
+        self.service.activate_dictionary(v2["id"])
+
+        # Short busy timeout so the test does not wait the default 30 s for the
+        # first blocked statement; the service-level retry must carry on after.
+        self.service.db.busy_timeout_ms = 50
+
+        holder, _ = self._hold_write_lock(1.0)
+        try:
+            done = threading.Event()
+
+            def convert() -> None:
+                self.service.run_recompression_once(limit=1)
+                done.set()
+
+            worker = threading.Thread(target=convert)
+            worker.start()
+            # The commit is blocked; the segment must remain on its old blob.
+            time.sleep(0.3)
+            row = self.service.get_segment(segment["number"])
+            self.assertIn(row["recompress_state"], ("running", "pending"))
+            self.assertEqual(row["dictionary_id"], v1["id"])
+            self.assertEqual(self.download(segment["number"]), SAMPLE)
+            self.assertTrue(worker.is_alive(), "conversion gave up while locked")
+            holder.join(5)
+            self.assertTrue(done.wait(10), "conversion did not finish after unlock")
+        finally:
+            holder.join(5)
+
+        row = self.service.get_segment(segment["number"])
+        self.assertEqual(row["recompress_state"], "current")
+        self.assertEqual(row["dictionary_id"], v2["id"])
+        # Lock contention is not a conversion failure: no attempts were spent.
+        self.assertEqual(row["recompress_attempts"], 0)
+        self.assertIsNone(row["recompress_error"])
+        self.assertEqual(self.download(segment["number"]), SAMPLE)
+
+    def test_background_worker_resumes_automatically_after_lock_clears(self) -> None:
+        service = ArchiveService(
+            Config(
+                data_dir=self.tmp,
+                worker_enabled=True,
+                recompress_delay_ms=0,
+                recompress_batch_size=4,
+                db_busy_timeout_seconds=0.05,
+            )
+        )
+        try:
+            v1 = service.create_dictionary("v1", DICT_V1)
+            v2 = service.create_dictionary("v2", DICT_V2)
+            service.activate_dictionary(v1["id"])
+            numbers = [
+                service.ingest_file(self.write_segment(f"l{i}.log"), f"l{i}.log")[
+                    "number"
+                ]
+                for i in range(3)
+            ]
+            service.activate_dictionary(v2["id"])
+            service.start_worker()
+
+            # Hold the write lock long enough for the worker to hit it.
+            self._hold_write_lock(1.5)[0].join(5)
+
+            self.assertTrue(service.wait_for_recompression(30))
+            for number in numbers:
+                row = service.get_segment(number)
+                self.assertEqual(row["dictionary_id"], v2["id"])
+                self.assertEqual(row["recompress_state"], "current")
+                self.assertEqual(row["recompress_attempts"], 0)
+                self.assertEqual(self.download(number), SAMPLE)
+            # The worker thread is still alive and idle, i.e. it never died.
+            self.assertTrue(service._worker is not None and service._worker.is_alive())
+        finally:
+            service.stop_worker()
+
+    def test_stale_running_rows_are_requeued_with_attempts_preserved(self) -> None:
+        v1, v2 = self.make_dictionaries()
+        self.service.activate_dictionary(v1["id"])
+        first = self.upload("first.log")
+        second = self.upload("second.log")
+        self.service.activate_dictionary(v2["id"])
+
+        # Simulate a worker that claimed a batch (both rows share the token)
+        # and then lost the chance to write any bookkeeping because the
+        # database stayed locked.
+        with self.service.db.write() as conn:
+            conn.execute(
+                """
+                UPDATE segments SET recompress_state = 'running',
+                                    recompress_token = 'orphan-token',
+                                    recompress_attempts = 2
+                 WHERE number IN (?, ?)
+                """,
+                (first["number"], second["number"]),
+            )
+
+        self.service._reap_stale_running()
+        for number in (first["number"], second["number"]):
+            row = self.service.get_segment(number)
+            self.assertEqual(row["recompress_state"], "pending")
+            self.assertEqual(row["recompress_attempts"], 2)
+            self.assertEqual(self.download(number), SAMPLE)
+
+        converted = self.service.run_recompression_once(limit=5)
+        self.assertEqual(converted, 2)
+        for number in (first["number"], second["number"]):
+            row = self.service.get_segment(number)
+            self.assertEqual(row["dictionary_id"], v2["id"])
+            self.assertEqual(row["recompress_state"], "current")
+            # A successful conversion resets the preserved counter.
+            self.assertEqual(row["recompress_attempts"], 0)
+
+    def test_lock_interruption_keeps_siblings_queued_with_original_attempts(self) -> None:
+        v1, v2 = self.make_dictionaries()
+        self.service.activate_dictionary(v1["id"])
+        first = self.upload("first.log")
+        second = self.upload("second.log")
+        self.service.activate_dictionary(v2["id"])
+
+        # Pre-existing retry budget on the second segment must survive a
+        # lock-induced interruption of the batch.
+        with self.service.db.write() as conn:
+            conn.execute(
+                "UPDATE segments SET recompress_attempts = 3 WHERE number = ?",
+                (second["number"],),
+            )
+
+        batch = self.service._claim_batch()
+        self.assertEqual(
+            {r["number"] for r in batch},
+            {first["number"], second["number"]},
+        )
+        self.service.db.busy_timeout_ms = 50
+
+        # Simulate the worker loop: while the first segment is mid-commit the
+        # maintenance lock appears.  The resilient write blocks until the lock
+        # clears, then the loop still has to park the untouched sibling.
+        holder, _ = self._hold_write_lock(0.8)
+        try:
+            finished = threading.Event()
+
+            def convert() -> None:
+                self.service._convert_claimed(batch[0])
+                finished.set()
+
+            thread = threading.Thread(target=convert)
+            thread.start()
+            time.sleep(0.3)
+            # While blocked, the original blob keeps serving downloads.
+            self.assertEqual(self.download(first["number"]), SAMPLE)
+            self.assertTrue(thread.is_alive())
+            holder.join(5)
+            self.assertTrue(finished.wait(10))
+            thread.join(5)
+        finally:
+            holder.join(5)
+
+        # The first segment completed; its budget was never touched.
+        row = self.service.get_segment(first["number"])
+        self.assertEqual(row["recompress_state"], "current")
+        self.assertEqual(row["dictionary_id"], v2["id"])
+        self.assertEqual(row["recompress_attempts"], 0)
+
+        # Park the not-yet-started sibling exactly like the worker loop does
+        # when a batch is cut short: attempts stay at their original value.
+        self.service._requeue_claimed(batch[1:])
+        row = self.service.get_segment(second["number"])
+        self.assertEqual(row["recompress_state"], "pending")
+        self.assertEqual(row["recompress_attempts"], 3)
+        self.assertEqual(self.download(second["number"]), SAMPLE)
+
+        self.service.run_recompression_once(limit=5)
+        row = self.service.get_segment(second["number"])
+        self.assertEqual(row["dictionary_id"], v2["id"])
+        self.assertEqual(row["recompress_state"], "current")
+        self.assertEqual(self.download(second["number"]), SAMPLE)
+
+    def test_genuine_failures_still_count_once_per_attempt(self) -> None:
+        service = ArchiveService(
+            Config(
+                data_dir=self.tmp,
+                worker_enabled=False,
+                recompress_delay_ms=0,
+                max_recompress_attempts=2,
+                db_busy_timeout_seconds=0.05,
+            )
+        )
+        try:
+            v1 = service.create_dictionary("v1", DICT_V1)
+            v2 = service.create_dictionary("v2", DICT_V2)
+            service.activate_dictionary(v1["id"])
+            segment = service.ingest_file(self.write_segment("z.log"), "z.log")
+            service.activate_dictionary(v2["id"])
+
+            # One lock-induced interruption spends nothing...
+            holder, _ = self._hold_write_lock(0.3)
+            try:
+                with mock.patch(
+                    "logarchive.archive.storage.compress_file",
+                    side_effect=sqlite3.OperationalError("database is locked"),
+                ):
+                    service.run_recompression_once(limit=1)
+            finally:
+                holder.join(5)
+            row = service.get_segment(segment["number"])
+            self.assertEqual(row["recompress_attempts"], 0)
+            self.assertEqual(row["recompress_state"], "pending")
+
+            # ...then two genuine failures exhaust the budget exactly.
+            with mock.patch(
+                "logarchive.archive.storage.compress_file",
+                side_effect=storage.StorageError("persistent disk failure"),
+            ):
+                for _ in range(3):
+                    with service.db.write() as conn:
+                        conn.execute(
+                            "UPDATE segments SET recompress_next_at = 0 WHERE number = ?",
+                            (segment["number"],),
+                        )
+                    service.run_recompression_once(limit=1)
+            row = service.get_segment(segment["number"])
+            self.assertEqual(row["recompress_state"], "failed")
+            self.assertEqual(row["recompress_attempts"], 2)
+            self.assertEqual(self.download(segment["number"]), SAMPLE)
+        finally:
+            service.stop_worker()
+
+    def test_old_conversion_cannot_commit_after_a_newer_dictionary_round(self) -> None:
+        v1, v2 = self.make_dictionaries()
+        third = self.service.create_dictionary("v3", DICT_V2 + b"more")
+        self.service.activate_dictionary(v1["id"])
+        segment = self.upload("first.log")
+        self.service.activate_dictionary(v2["id"])
+
+        # Build a v2 result, but before its commit another activation starts a
+        # fresh round and resets the queue.  The stale commit must not win.
+        original_decompress = storage.decompress_file
+        switched = {"done": False}
+
+        def decompress_then_switch_twice(*args, **kwargs):
+            result = original_decompress(*args, **kwargs)
+            if not switched["done"]:
+                switched["done"] = True
+                self.service.activate_dictionary(third["id"])
+            return result
+
+        with mock.patch(
+            "logarchive.archive.storage.decompress_file", decompress_then_switch_twice
+        ):
+            self.service.run_recompression_once(limit=1)
+
+        row = self.service.get_segment(segment["number"])
+        self.assertEqual(row["dictionary_id"], v1["id"])
+        self.assertEqual(row["recompress_state"], "pending")
+
+        self.service.run_recompression_once(limit=5)
+        row = self.service.get_segment(segment["number"])
+        self.assertEqual(row["dictionary_id"], third["id"])
+        self.assertEqual(row["recompress_state"], "current")
+        self.assertEqual(self.download(segment["number"]), SAMPLE)
 
 
 class ConcurrencyTests(ArchiveTestCase):
