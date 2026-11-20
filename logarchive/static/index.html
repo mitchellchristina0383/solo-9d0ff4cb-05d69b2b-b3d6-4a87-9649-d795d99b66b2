@@ -1,0 +1,140 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>归档日志段 · 压缩字典管理</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <span class="logo">▤</span>
+    <div>
+      <h1>归档日志段</h1>
+      <p class="subtitle">zlib 预置字典压缩 · 按段号取回原始字节</p>
+    </div>
+  </div>
+  <div class="status-pill" id="worker-pill" title="后台换版进度">
+    <span class="dot" id="worker-dot"></span>
+    <span id="worker-text">读取状态…</span>
+  </div>
+</header>
+
+<main>
+  <section class="panel" id="status-panel">
+    <h2>当前状态</h2>
+    <div class="metrics">
+      <div class="metric">
+        <span class="metric-label">生效字典</span>
+        <span class="metric-value" id="m-active">—</span>
+        <span class="metric-note" id="m-active-note"></span>
+      </div>
+      <div class="metric">
+        <span class="metric-label">段数</span>
+        <span class="metric-value" id="m-segments">0</span>
+        <span class="metric-note" id="m-bytes"></span>
+      </div>
+      <div class="metric">
+        <span class="metric-label">待换版</span>
+        <span class="metric-value" id="m-backlog">0</span>
+        <span class="metric-note" id="m-states"></span>
+      </div>
+      <div class="metric">
+        <span class="metric-label">转换中</span>
+        <span class="metric-value" id="m-worker">—</span>
+        <span class="metric-note" id="m-current"></span>
+      </div>
+    </div>
+    <div class="banner warn hidden" id="error-banner">
+      <strong>最近一次转换失败</strong>
+      <span id="error-text"></span>
+      <button class="link" id="retry-failed">全部重试</button>
+    </div>
+  </section>
+
+  <div class="columns">
+    <section class="panel">
+      <h2>压缩字典</h2>
+      <p class="hint">上传一个 ≤ 32 KiB 的 zlib 预置字典。启用后，新入库的段立即使用新版压缩；已归档的段由后台分批重压，期间照常入库与下载。</p>
+
+      <form id="dict-form" class="stack">
+        <label class="field">
+          <span>字典名称（可选）</span>
+          <input type="text" name="name" maxlength="80" placeholder="例如 access-v2">
+        </label>
+        <label class="field file-drop" id="dict-drop">
+          <span>字典文件</span>
+          <input type="file" name="dictionary" id="dict-file" required>
+          <em id="dict-file-label">点击选择或拖入文件（≤ 32 KiB）</em>
+        </label>
+        <label class="check">
+          <input type="checkbox" id="dict-activate" checked>
+          <span>上传后立即启用</span>
+        </label>
+        <button type="submit" class="primary" id="dict-submit">上传字典</button>
+      </form>
+
+      <div class="table-wrap">
+        <table class="table" id="dict-table">
+          <thead>
+            <tr><th>名称</th><th>大小</th><th>SHA-256</th><th>引用段</th><th>状态</th><th></th></tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>上传日志段</h2>
+      <p class="hint">一次可传多个文件，每个文件成为一个段号，下载时按段号取回并沿用原文件名。上传期间若字典换版，该段会自动改用新字典重新压缩后入库。</p>
+      <form id="seg-form" class="stack">
+        <label class="field file-drop" id="seg-drop">
+          <span>日志段文件</span>
+          <input type="file" name="file" id="seg-file" multiple required>
+          <em id="seg-file-label">点击选择或拖入文件（可多选）</em>
+        </label>
+        <button type="submit" class="primary" id="seg-submit">上传入库</button>
+        <div class="progress hidden" id="seg-progress">
+          <div class="bar"><i id="seg-bar"></i></div>
+          <span id="seg-progress-text"></span>
+        </div>
+      </form>
+      <div class="log" id="upload-log" aria-live="polite"></div>
+    </section>
+  </div>
+
+  <section class="panel">
+    <div class="panel-head">
+      <h2>归档段</h2>
+      <div class="actions">
+        <button class="ghost" id="refresh-btn">刷新</button>
+        <label class="check inline">
+          <input type="checkbox" id="auto-refresh" checked>
+          <span>自动刷新</span>
+        </label>
+      </div>
+    </div>
+    <div class="table-wrap">
+      <table class="table" id="seg-table">
+        <thead>
+          <tr>
+            <th>段号</th><th>文件名</th><th>原始大小</th><th>压缩后</th>
+            <th>字典</th><th>换版状态</th><th>入库时间</th><th></th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </div>
+    <div class="pager">
+      <button class="ghost" id="prev-page">上一页</button>
+      <span id="page-info"></span>
+      <button class="ghost" id="next-page">下一页</button>
+    </div>
+  </section>
+</main>
+
+<div class="toast-wrap" id="toasts" aria-live="polite"></div>
+<script src="/static/app.js"></script>
+</body>
+</html>

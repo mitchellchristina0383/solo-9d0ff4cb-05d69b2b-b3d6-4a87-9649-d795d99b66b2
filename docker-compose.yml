@@ -1,0 +1,36 @@
+services:
+  logarchive:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: logarchive:local
+    container_name: logarchive
+    restart: unless-stopped
+    ports:
+      - "${PORT:-8080}:8080"
+    environment:
+      DATA_DIR: /data
+      PORT: "8080"
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      MAX_SEGMENT_BYTES: ${MAX_SEGMENT_BYTES:-536870912}
+      RECOMPRESS_DELAY_MS: ${RECOMPRESS_DELAY_MS:-100}
+      RECOMPRESS_BATCH_SIZE: ${RECOMPRESS_BATCH_SIZE:-8}
+      MAX_RECOMPRESS_ATTEMPTS: ${MAX_RECOMPRESS_ATTEMPTS:-5}
+      VERIFY_WRITES: ${VERIFY_WRITES:-true}
+      WORKER_ENABLED: ${WORKER_ENABLED:-true}
+    volumes:
+      - archive-data:/data
+    healthcheck:
+      test:
+        - CMD
+        - python3
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=2).read()"
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+    stop_grace_period: 30s
+
+volumes:
+  archive-data:
